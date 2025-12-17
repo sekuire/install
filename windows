@@ -1,0 +1,194 @@
+# Sekuire CLI Installer for Windows
+# Usage: irm https://install.sekuire.com/windows | iex
+
+$ErrorActionPreference = "Stop"
+
+# Configuration
+$InstallDir = if ($env:SEKUIRE_INSTALL_DIR) { $env:SEKUIRE_INSTALL_DIR } else { "$env:USERPROFILE\.sekuire\bin" }
+$BinaryName = "sekuire.exe"
+$Repo = "sekuire/releases"
+$GitHubAPI = "https://api.github.com/repos/$Repo/releases/latest"
+
+function Write-ColorOutput($ForegroundColor, $Message) {
+    $fc = $host.UI.RawUI.ForegroundColor
+    $host.UI.RawUI.ForegroundColor = $ForegroundColor
+    Write-Output $Message
+    $host.UI.RawUI.ForegroundColor = $fc
+}
+
+function Log-Info($message) {
+    Write-ColorOutput Green "[INFO] $message"
+}
+
+function Log-Warn($message) {
+    Write-ColorOutput Yellow "[WARN] $message"
+}
+
+function Log-Error($message) {
+    Write-ColorOutput Red "[ERROR] $message"
+    exit 1
+}
+
+function Log-Step($message) {
+    Write-ColorOutput Cyan "==> $message"
+}
+
+# Detect architecture
+function Get-Architecture {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+
+    switch ($arch) {
+        "AMD64" { return "x86_64" }
+        "ARM64" { return "aarch64" }
+        default { Log-Error "Unsupported architecture: $arch" }
+    }
+}
+
+# Get latest version
+function Get-LatestVersion {
+    Log-Step "Fetching latest version..."
+
+    try {
+        $response = Invoke-RestMethod -Uri $GitHubAPI -UseBasicParsing
+        $version = $response.tag_name -replace '^v', ''
+        Log-Info "Latest version: v$version"
+        return $version
+    } catch {
+        Log-Error "Failed to fetch latest version: $_"
+    }
+}
+
+# Download and install binary
+function Install-Binary {
+    param($version, $arch)
+
+    $binaryTarget = "sekuire-windows-$arch"
+    $downloadUrl = "https://github.com/$Repo/releases/download/v$version/$binaryTarget.zip"
+    $checksumUrl = "$downloadUrl.sha256"
+
+    Log-Step "Downloading from: $downloadUrl"
+
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $zipPath = Join-Path $tempDir "$binaryTarget.zip"
+    $checksumPath = Join-Path $tempDir "$binaryTarget.zip.sha256"
+
+    try {
+        # Download binary
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+
+        # Download checksum
+        try {
+            Invoke-WebRequest -Uri $checksumUrl -OutFile $checksumPath -UseBasicParsing
+
+            # Verify checksum
+            Log-Step "Verifying checksum..."
+            $downloadedHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+            $expectedHash = (Get-Content $checksumPath -Raw).Split()[0].Trim().ToLower()
+
+            if ($downloadedHash -ne $expectedHash) {
+                Log-Error "Checksum verification failed!`nExpected: $expectedHash`nGot: $downloadedHash"
+            }
+            Log-Info "✓ Checksum verified"
+        } catch {
+            Log-Warn "Checksum file not found, skipping verification"
+        }
+
+        # Create install directory
+        if (!(Test-Path $InstallDir)) {
+            New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        }
+
+        # Extract binary
+        Log-Step "Extracting binary..."
+        Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
+
+        # Move binary to install directory
+        $extractedBinary = Join-Path $tempDir $binaryTarget
+        if (Test-Path "$extractedBinary.exe") {
+            Move-Item -Path "$extractedBinary.exe" -Destination (Join-Path $InstallDir $BinaryName) -Force
+        } elseif (Test-Path $extractedBinary) {
+            Move-Item -Path $extractedBinary -Destination (Join-Path $InstallDir $BinaryName) -Force
+        } else {
+            Log-Error "Extracted binary not found"
+        }
+
+        # Cleanup
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $checksumPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractedBinary -Force -ErrorAction SilentlyContinue
+
+        Log-Info "✓ Binary installed successfully to: $InstallDir"
+
+    } catch {
+        Log-Error "Installation failed: $_"
+    }
+}
+
+# Add to PATH
+function Add-ToPath {
+    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+
+    if ($currentPath -notlike "*$InstallDir*") {
+        Log-Step "Adding $InstallDir to PATH..."
+
+        $newPath = "$InstallDir;$currentPath"
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+
+        # Update current session
+        $env:Path = "$InstallDir;$env:Path"
+
+        Log-Info "✓ PATH updated successfully"
+    } else {
+        Log-Info "✓ Install directory already in PATH"
+    }
+}
+
+# Verify installation
+function Test-Installation {
+    Log-Step "Verifying installation..."
+
+    $binaryPath = Join-Path $InstallDir $BinaryName
+
+    if (Test-Path $binaryPath) {
+        # Refresh PATH in current session
+        $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" + [Environment]::GetEnvironmentVariable("Path", "Machine")
+
+        try {
+            $version = & $binaryPath --version 2>&1
+            Log-Info "✓ Installation successful!"
+            Write-Output ""
+            Write-Output "  $version"
+            Write-Output ""
+            Log-Info "Get started with: sekuire --help"
+        } catch {
+            Log-Warn "Binary installed but verification failed. Try restarting your terminal."
+        }
+    } else {
+        Log-Error "Binary not found at: $binaryPath"
+    }
+}
+
+# Main installation flow
+function Main {
+    Write-Output ""
+    Write-Output "╔═══════════════════════════════════════╗"
+    Write-Output "║   Sekuire CLI Installer v1.0.0       ║"
+    Write-Output "╚═══════════════════════════════════════╝"
+    Write-Output ""
+
+    $arch = Get-Architecture
+    Log-Info "Detected architecture: $arch"
+
+    $version = Get-LatestVersion
+    Install-Binary -version $version -arch $arch
+    Add-ToPath
+    Test-Installation
+
+    Write-Output ""
+    Log-Info "Installation complete! 🎉"
+    Write-Output ""
+    Log-Warn "Please restart your terminal for PATH changes to take effect."
+}
+
+# Run installer
+Main
